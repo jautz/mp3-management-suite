@@ -1,0 +1,50 @@
+2012-04-09  Joachim Jautz
+
+	* mms-filename2tag, mms-tag2filename: added a hint to the manual page
+	that the placeholder names in patterns are case-insensitive when using
+	MP3::InfoTag v0.40+
+
+2006-09-30  Joachim Jautz
+
+	* mms-filename2tag: new option --weed to replace certain characters by
+	spaces on writing tag fields
+
+	* mms-settag: print error message on all possible failures during tag
+	removal
+
+	* mms-detagtor: fixed a bug of the --find option that occured when
+	searching for special tag versions; to solve this, the syntax of this
+	option had to be changed slightly (use --man to read more)
+
+2005-09-12  Joachim Jautz
+
+	* mms-filename2tag: error in manual page corrected
+
+2005-09-11  Joachim Jautz
+
+	* mms-filename2tag:
+	- new option --tracklist to use titles from a tracklist file
+	- changed default pattern to ((IGNORE)), so omitting the --pattern
+	  option while using --tracklist works in a reasonable way
+
+2005-08-01  Joachim Jautz
+
+	* mms-settag: messages on tag removal improved again
+
+2005-08-01  Joachim Jautz
+
+	* mms-settag: messages on tag removal now more accurate (nothing
+	removed / number of bytes removed / error)
+
+2005-08-01  Joachim Jautz
+
+	* mms-detagtor: filter (--find option) completely implemented and
+	documented
+
+2005-07-31  Joachim Jautz
+
+	* general: put all scripts under GNU General Public Licence
+
+2005-07-30  Joachim Jautz
+
+	* general: import of mp3ManagementSuite v1.0pre2

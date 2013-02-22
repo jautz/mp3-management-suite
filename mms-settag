@@ -1,0 +1,727 @@
+#!/usr/bin/perl -w
+#
+# $Id: mms-settag,v 1.5 2006-09-30 16:15:36 odin Exp $
+# $Name: rel_1_03 $
+#
+###############################################################################
+#
+# Copyright (C) 2004   Joachim Jautz   http://www.jay-jay.net/contact.html
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 2 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
+#
+###############################################################################
+
+use File::Find;
+use File::Basename;
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+use MP3::Info;
+use MP3::InfoTag ':typical';
+use Util::Logger;
+
+my $VERSION = get_version('$Name: rel_1_03 $') || 'non-released; CVS $Id: mms-settag,v 1.5 2006-09-30 16:15:36 odin Exp $';
+
+##### process command line options #############################################
+
+my $options = { # set defaults
+  help => 0,
+  listgenres => undef,
+  man => 0,
+  purify => undef,
+  recurse => 0,
+  simulate => 0,
+  settitle => undef,
+  setartist => undef,
+  setalbum => undef,
+  setyear => undef,
+  setcomment => undef,
+  settracknum => undef,
+  setgenre => undef,
+  verbose => 'INFO',
+  version => '',
+  DIRS => [],
+  FILES => []
+};
+
+unless (parseCommandLineOptions($options)) {
+  usage_err("could not parse command line arguments");
+}
+
+if (defined $options->{purify}) {
+  unless ($options->{purify} eq '' || $options->{purify} =~ m/v[12]|all/i) {
+    usage_err("illegal value for --purify: '$options->{purify}', see manual.");
+  }
+}
+
+##### instantiate used classes #################################################
+
+my $log = Util::Logger->new({ loglevel => $options->{verbose} });
+
+##### special command line options #############################################
+
+if ($options->{help} == 1) {
+  pod2usage(-exitval => 0, -verbose => 0);
+} elsif ($options->{help} > 1) {
+  pod2usage(-exitval => 0, -verbose => 1);
+} elsif ($options->{man}) {
+  pod2usage(-exitval => 0, -verbose => 2);
+} elsif ($options->{version}) {
+  print "$VERSION\n";
+  exit(0);
+} elsif (defined $options->{listgenres}) {
+  listGenres($options->{listgenres});
+  exit(0);
+} elsif (!@ARGV) {
+  usage_err("at least one file or directory expected");
+} else {
+  foreach my $item (@ARGV) {
+    if (-d $item) {
+      push @{$options->{DIRS}}, $item;
+    } elsif (-f $item) {
+      ($item =~ m/\.mp3/i)
+        ? push @{$options->{FILES}}, $item
+        : $log->print('WARN', "Ignoring file argument '$item'. ".
+                              "In order to avoid corruption of files ".
+                              "only those with .mp3 extension are processed.");
+    } else {
+      $log->print('WARN', "Ignoring command line argument '$item'. ".
+                          "It is neither a directory nor a file.");
+    }
+  }
+}
+
+##### core functionality #######################################################
+
+# process directories
+foreach my $dir (@{$options->{DIRS}}) {
+  find({ preprocess => \&preprocess, wanted => \&process }, $dir);
+}
+
+# process files
+foreach my $file (@{$options->{FILES}}) {
+  $log->print('INFO', 'processing file '.$file);
+  processFile($file);
+}
+
+$log->print('INFO', 'Done.');
+exit 0;
+
+################################################################################
+##### SUBROUTINES ##############################################################
+################################################################################
+
+sub preprocess {
+  $log->print('INFO', 'processing directory '.$File::Find::dir);
+  my @result = ();
+  while (my $element = shift @_) {
+    if (-d $element  &&  $options->{recurse}  &&  $element !~ m/^\.{1,2}$/  ||
+        -f $element  &&  $element =~ m/\.mp3$/i) {
+      push @result, $element;
+    }
+  }
+  return sort(@result);
+}
+
+################################################################################
+
+sub process {
+  # File::Find also passes current directory name that we do not need here
+  return if (-d $_);
+  processFile($_);
+}
+
+################################################################################
+
+sub processFile {
+  my $file = shift;
+  unless (-f $file && -r $file) {
+    $log->print('WARN', "file '$file' is no file or not readable");
+    return;
+  }
+  my $basename = basename($file);
+
+  my $tagIsEmpty = 0;    # true if all tag fields are empty
+  my $removeTag = 0;     # sums up the version numbers of the tags to be removed
+
+  # get the tag to work with
+  my $tag;
+  if (defined $options->{purify}) {
+    if ($options->{purify} =~ m/v2|all/i) {
+      $removeTag += 2;   # v2 tag is to be removed
+    }
+    if ($options->{purify} eq '' || $options->{purify} =~ m/v1|all/i) {
+      $tag = undef;      # v1 tag is to be cleared before setting field values
+    } else {
+      $tag = get_mp3tag($file, 1);
+    }
+  } else {
+    $tag = get_mp3tag($file, 1);
+  }
+  #create an empty tag if none could be read or if the old one is to be purified
+  if (!defined($tag)) {
+    $tag = createNewTag();
+    $tagIsEmpty = 1;
+  }
+
+  $log->print('DEBUG', "file '$basename': current ID3 tag: ".printTag($tag));
+
+  # set tag fields to user defined values; do not write to disk yet
+  my $changed = setTagFields($tag, $file);
+
+  if ($changed == 0) {
+    # tag was NOT changed
+    if ($tagIsEmpty) {
+      $removeTag += 1;
+      $log->print('DEBUG',
+                  "file '$basename': marking v1 tag to be completely removed");
+    } else {
+      $log->print(($options->{simulate} ? 'INFO' : 'MORE'),
+             "file '$basename': ID3 tag already set correctly. Doing nothing.");
+    }
+  } else {
+    # tag was changed
+    if ($options->{simulate}) {
+      $log->print('INFO', "file '$basename': new ID3 tag would be: ".
+                          printTag($tag));
+    } elsif (-w $file) {
+      if (set_mp3tag($file, $tag)) {
+        $log->print('MORE', "file '$basename': new ID3 tag is: ".
+                            printTag($tag));
+      } else {
+        $log->print('ERROR', "file '$file': cannot write ID3 tag.");
+      }
+    } else {
+      $log->print('WARN', "file '$file' is read-only. Cannot write ID3 tag.");
+    }
+  }
+
+  # remove v1, v2 or both tags (3 means v1 + v2)?
+  if ($removeTag > 0) {
+    my $res = removeTag($removeTag, $file);
+    if (! defined $res || $res < 0) {
+      $log->print('ERROR', "file '$file': failed to remove ID3 tag.");
+    }
+  }
+}
+
+################################################################################
+# setTagFields(<hashRef> tag, <string> file)
+#
+# Sets the tag fields according to the values given by command line options.
+#
+# Returns the number of changed tag fields or undef on error.
+
+sub setTagFields {
+  my $tag = shift;
+  my $file = shift;
+  unless (ref($tag) eq 'HASH') {
+    $log->print('ERROR', "no tag reference");
+    return undef;
+  }
+  unless (defined $file) {
+    $log->print('ERROR', "no filename");
+    return undef;
+  }
+  my $tagFields = getTagFields();
+
+  my $changed = 0;   # counts number of changed tag fields
+  foreach my $opt (keys %{$options}) {
+    # iterating over all tag-field-setting options
+    # these begin with `set' followed by the field name, e.g. settitle
+    next unless ($opt =~ m/^set(\w+)$/ && exists $tagFields->{uc($1)});
+    my $fieldName = uc $1;
+    my $fieldValue = $options->{$opt};
+    if (defined $fieldValue) {
+      # check validity of GENRE value
+      $fieldValue = getGenre($fieldValue) if ($fieldName eq 'GENRE');
+      # set new field value unless already set correctly
+      if ($tag->{$fieldName} ne $fieldValue) {
+        $log->print('DEBUG',
+                 "file '$file': setting tag field $fieldName to '$fieldValue'");
+        if (setTagField($tag, $fieldName, $fieldValue)) {
+          ++$changed;
+        } else {
+          $log->print('ERROR', "file '$file': setTagField failed: ".
+                               MP3::InfoTag::getError());
+        }
+      }
+    }
+  }
+
+  if (my @warnings = MP3::InfoTag::flushWarnings()) {
+    $log->print('WARN', "file '$file': ".join('; ', @warnings));
+  }
+  return $changed;
+}
+
+################################################################################
+# getGenre(<string> input)
+#
+# Checks if the input can be successfully interpreted as genre.
+# Accepts either a string that must match a valid genre or a number which
+# must be a valid index of a genre.
+#
+# Returns either a valid genre name or the empty string.
+
+sub getGenre {
+  my $input = shift;
+  my $output = '';
+  return $output unless (defined $input);
+
+  if ($input =~ m/^\d+$/) {
+    # got genre index
+    if ($input >= 0 && $input < @MP3::Info::mp3_genres) {
+      $output = $MP3::Info::mp3_genres[$input];
+    } else {
+      $log->print('WARN', "ignoring illegal genre index: $input");
+    }
+  } else {
+    # got genre name
+    if (my $index = $MP3::Info::mp3_genres{$input}) {
+      # genre was found in hash, now use the mixed case name from the array
+      $output = $MP3::Info::mp3_genres[$index];
+    } else {
+      $log->print('WARN', "ignoring illegal genre: $input");
+    }
+  }
+  return $output;
+}
+
+################################################################################
+# removeTag(<int> tagID, <string> file)
+#
+# Removes a file's ID3 tag(s).
+# If the specified tag is not present nothing is done.
+# The tagID argument defines what to remove:
+#   1   remove ID3v1 tag
+#   2   remove ID3v2 tag
+#   3   remove both tags
+#
+# Returns 0 on success, -1 if permissions are insufficient
+# or undef if there is an unknown error.
+
+sub removeTag {
+  my $tagID = shift;
+  my $file = shift;
+
+  unless (defined $tagID  &&  $tagID > 0  &&  $tagID <= 3) {
+    $log->print('ERROR', "invalid tagID $tagID");
+    return undef;
+  }
+  unless (defined $file) {
+    $log->print('ERROR', "no filename");
+    return undef;
+  }
+
+  $tagID = 'ALL' if ($tagID == 3);
+  my $result = undef;
+
+  if ($options->{simulate}) {
+    $log->print('INFO', "file '$file': ".
+                        ($tagID eq 'ALL' ? 'all tags' : "v$tagID tag").
+                        " (if present) would be removed");
+    $result = 0;
+
+  } elsif (-w $file) {
+    my $message = "file '$file': removing ".
+                  ($tagID eq 'ALL' ? 'all tags' : "v$tagID tag").
+                  ' (if present) ... ';
+    $result = remove_mp3tag($file, $tagID);
+    if (! defined $result) {
+      $message .= 'ERROR.';
+    } elsif ($result < 0) {
+      $message .= 'nothing removed.';
+    } else {
+      $message .= "OK ($result bytes).";
+    }
+    $log->print('MORE', $message);
+    $result = defined $result ? 0 : undef;
+
+  } else {
+    $log->print('WARN', "file '$file' is read-only. Cannot remove ID3 tag.");
+    $result = -1;
+  }
+  return $result;
+}
+
+################################################################################
+# listGenres([<string> search])
+#
+# Prints a 2-column list of all genres that can be used for the ID3 tag field
+# `GENRE'. With the optional search argument given, the list will only contain
+# those genres that contain the search expression.
+#
+# Returns the number of genres that were found
+
+sub listGenres {
+  my $search = shift;
+
+  my $index = -1;   # array index of a genre
+  my $count = 0;    # number of genres found
+  my $buffer = '';
+  foreach my $genre (@MP3::Info::mp3_genres) {
+    ++$index;
+    if (defined $search) {
+      next unless ($genre =~ m/$search/i);
+    }
+    ++$count;
+    # use 2-column mode for printing results
+    if ($count % 2 != 0) {
+      $buffer .= sprintf("%2d %-30s\t", $index, $genre);
+    } else {
+      $buffer .= sprintf("%2d %-30s\n", $index, $genre);
+    }
+  }
+  print "Found $count genres\n";
+  print "$buffer\n" if ($count > 0);
+  return $count;
+}
+
+################################################################################
+
+sub parseCommandLineOptions {
+  my $opts = shift;
+  return undef unless (ref($opts) eq 'HASH');
+
+  my $optionParser = Getopt::Long::Parser->new(config => ["bundling"]);
+
+  return $optionParser->getoptions(
+    'help|h|?+' => \$opts->{help},
+    'listgenres:s' => \$opts->{listgenres},
+    'man' => \$opts->{man},
+    'purify:s' => \$opts->{purify},
+    'recurse|r' => \$opts->{recurse},
+    'simulate|s' => \$opts->{simulate},
+    'settitle=s' => \$opts->{settitle},
+    'setartist=s' => \$opts->{setartist},
+    'setalbum=s' => \$opts->{setalbum},
+    'setyear=i' => \$opts->{setyear},
+    'setcomment=s' => \$opts->{setcomment},
+    'settracknum=i' => \$opts->{settracknum},
+    'setgenre=s' => \$opts->{setgenre},
+    'verbose|v=s' => \$opts->{verbose},
+    'version|V' => \$opts->{version}
+  );
+}
+
+################################################################################
+# get_version('$Name: rel_1_03 $')
+#
+# Extracts the release version from the CVS Name Tag that was used to checkout
+# or export the file from the repository.
+# Returns undef if it is empty (e.g. after checkout/export without -r <CVSTAG>)
+# or if it does not match the pattern (expects something like rel_1_23).
+# Otherwise a string like 1.23 is returned.
+#
+sub get_version {
+  return undef unless (defined $_[0]);
+
+  return $_[0] =~ m/rel_(\d+)_(\d+)/ ? "$1.$2" : undef;
+}
+
+################################################################################
+# usage_err([<string> err])
+#
+# This exits the program with return code 1 after printing a hint how
+# to use it.
+# This hint is the SYNOPSIS section of the program's POD documentation.
+# The optional err argument can be given to print an error message first.
+#
+sub usage_err {
+  my $err = shift;
+
+  if (defined $err) {
+    pod2usage(-exitval => 1, -verbose => 0, -message => "\nERROR: $err\n");
+  } else {
+    pod2usage(-exitval => 1, -verbose => 0);
+  }
+}
+
+
+__END__
+
+
+=head1 NAME
+
+mms-settag - set or erase the ID3 tag of MP3 files
+
+
+
+=head1 SYNOPSIS
+
+How to get help:
+If one of the B<--help> options is specified once a short overview will
+be printed;
+if specified twice you will get detailed information about command line options.
+B<--man> gives you the whole manual.
+
+B<mms-settag>
+[ B<--listgenres> [I<STRING>] ] |
+[ B<--purify> [I<v1>|I<v2>|I<all>] ]
+[ B<-r>, B<--recurse> ]
+[ B<-s>, B<--simulate> ]
+[ B<--settitle> I<STRING> ]
+[ B<--setartist> I<STRING> ]
+[ B<--setalbum> I<STRING> ]
+[ B<--setyear> I<NUMBER> ]
+[ B<--setcomment> I<STRING> ]
+[ B<--settracknum> I<NUMBER> ]
+[ B<--setgenre> I<STRING>|I<NUMBER> ]
+[ B<-v>, B<--verbose> I<STRING> ]
+{ F<FILE> | F<DIRECTORY> } F<...>
+
+B<mms-settag> B<-?>, B<-h>, B<--help> | B<--man>
+
+B<mms-settag> B<-V>, B<--version>
+
+
+
+=head1 DESCRIPTION
+
+B<mms-settag> is part of the `mp3ManagementSuite' which is a collection of
+programs that help maintaining music collections.
+
+You can decide which .mp3 files will be processed by passing names of files or
+directories. At least one file or directory is expected.
+
+For each file it will set the ID3 tag according to the options given.
+Typically you will give an option like C<--setalbum 'The Number of the Beast'>
+which will result in setting the ALBUM field of all files' tags to this string.
+
+The ID3 tag will be modified only if all the necessary information can be
+gathered, otherwise this program will report an error message and leave the
+file unchanged.
+
+Please read the section ID3 TAG VERSIONS for general information about tags as
+well as some explanations how different tag versions are handled by this
+program.
+
+
+
+=head1 OPTIONS
+
+This paragraph describes the possible options that can be used to modify this
+program's behaviour.
+If a long option name requires an argument then the short form does so, too.
+Long names can be abbreviated but must stay unique.
+Short options can be bundled even if they have arguments; thus `-a12b34c' is
+equivalent to `-a 12 -b 34 -c'.
+To avoid ambiguity you can use ` -- ' to seperate the options from the list of
+directories and files.
+
+=over 4
+
+=item B<-?>, B<-h>, B<--help>
+
+Prints the possible options and exits.
+
+
+=item B<--man>
+
+Prints the whole manual and exits.
+
+
+=item B<--listgenres> [I<STRING>]
+
+Prints all available genres and their index number and then exits.
+This option can be used to find a value for the B<--setgenre> option.
+If you give a I<STRING> as value it will be used as search pattern, i.e. you
+will see genres that match or contain your search string. The search is
+case-insensitive.
+
+
+=item B<--purify> [I<v1>|I<v2>|I<all>]
+
+Enables a program mode that clears all ID3 tag fields before writing any given
+values into it.
+Without using this option, affected tag entries are overwritten with their new
+value and the other entries remain unchanged.
+
+As a special case you can use this option to completely remove ID3 tags
+from your files. This happens if you don't give any B<--set...> option.
+
+By passing one of the optional values you can specify which tags should be
+removed:
+
+=over 4
+
+=item I<v1>
+
+DEFAULT: Only C<ID3v1> tags will be erased.
+
+=item I<v2>
+
+C<ID3v2> tags will be removed; this is useful if you want to clean your
+collection from those tags.
+
+=item I<all>
+
+Both types of tags will be erased.
+
+=back
+
+
+=item B<-r>, B<--recurse>
+
+Enables recursive processing of subdirectories for each of the given directory
+arguments.
+
+
+=item B<-s>, B<--simulate>
+
+Read-only mode, no changes will be made. Helps finding out which files will be
+affected.
+This mode is a bit more verbose than the `real' mode because in a simulation
+you will probably want to see what B<would> happen. More precicely, operations
+that would change a file will be reported as C<INFO> while simulating, but in
+`real' mode you will have to switch to C<MORE> to get such an operation
+reported.
+
+
+=item B<--set...>
+
+The options in this section let you define which tag fields should be set.
+They share some common behaviour:
+If you don't set one of these options the corresponding tag field will not be
+changed.
+If you use an option with the empty string as value ("") the corresponding tag
+field will be cleared.
+
+In order to clear all fields before writing data into the tag or even remove a
+tag completely consider using the B<--purify> option.
+
+=over 4
+
+=item B<--settitle> I<STRING>(30)
+
+Sets all files' TITLE field to I<STRING>.
+If it exceeds the maximum length of 30 characters it will be truncated.
+
+
+=item B<--setartist> I<STRING>(30)
+
+Sets all files' ARTIST field to I<STRING>.
+If it exceeds the maximum length of 30 characters it will be truncated.
+
+
+=item B<--setalbum> I<STRING>(30)
+
+Sets all files' ALBUM field to I<STRING>.
+If it exceeds the maximum length of 30 characters it will be truncated.
+
+
+=item B<--setyear> I<NUMBER>
+
+Sets all files' YEAR field to I<NUMBER>.
+This must be a 4-digit number; otherwise an error will be raised.
+
+
+=item B<--setcomment> I<STRING>(30)
+
+Sets all files' COMMENT field to I<STRING>.
+If it exceeds the maximum length of 30 characters it will be truncated.
+If the TRACKNUM field is already set or will be set by execution of this
+program, then only 28 characters are available.
+
+
+=item B<--settracknum> I<NUMBER>
+
+Sets all files' TRACKNUM field to I<NUMBER>.
+If I<NUMBER> is not between 1 and 255 an error will be raised.
+
+
+=item B<--setgenre> I<STRING>|I<NUMBER>
+
+Sets all files' GENRE field to I<STRING> which must be a valid genre title or
+genre index I<NUMBER>; otherwise an error will be raised.
+Using a I<NUMBER> is recommended because of brevity.
+You can find out all available genres with their index number by using the
+B<--listgenres> option.
+
+=back
+
+
+=item B<-v>, B<--verbose> I<STRING>
+
+Adjusts the level of output verbosity. There are five categories, ordered by
+severity. This setting means that all messages up to the given severity level
+will be reported; less severe messages will be suppressed.
+
+I<STRING> defaults to C<INFO> which means that all messages from the categories
+C<FATAL>, C<ERROR>, C<WARN> and C<INFO> will be reported.
+Possible values for I<STRING> are:
+
+  FATAL
+  ERROR
+  WARN
+  INFO
+  MORE
+
+
+=item B<-V>, B<--version>
+
+Prints the program version and exits.
+
+
+=back
+
+
+
+=head1 ID3 TAG VERSIONS
+
+The so-called tag is a small optional part of an MPEG Layer 3 file that contains
+information about the audio part, e.g. the artist's name, a comment etc.
+
+There are two major versions of MP3 tag formats, C<ID3v1> and C<ID3v2>.
+All programs of the `mp3ManagementSuite' are focused on the C<ID3v1> tag
+(or C<ID3v1.1> if the C<TRACKNUM> field is used).
+In most cases the presence of an C<ID3v2> tag will be simply ignored.
+
+More specifically, it will never be read from or written to a version2 tag.
+There are only two actions that involve version2 tags:
+You can use B<mms-detagtor> to find files depending on their tag version
+and you can use B<mms-settag> to erase version2 tags.
+
+This behaviour is due to the author's opinion that C<ID3v2> is totally
+superfluous. Most people are not even able to maintain the v1-tags of their
+music archive (except if they use tools like this ;)).
+Moreover, in comparison to v1-tags that are appended to the file, v2-tags are
+prepended and this means that the whole file must be rewritten every time a
+v2-tag is changed. Contrary opinions are respected but there are other tools for
+those people's requirements.
+
+
+
+=head1 COPYRIGHT AND LICENCE
+
+Copyright (C) 2004   Joachim Jautz   http://www.jay-jay.net/contact.html
+
+This program is free software; you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation; either version 2 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program; if not, write to the Free Software
+Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
+
+=cut

@@ -1,0 +1,437 @@
+#!/usr/bin/perl -w
+#
+# $Id: mms-m3umaker,v 1.2 2005-07-31 10:35:13 odin Exp $
+# $Name: rel_1_03 $
+#
+###############################################################################
+#
+# Copyright (C) 2004   Joachim Jautz   http://www.jay-jay.net/contact.html
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 2 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
+#
+###############################################################################
+
+use File::Find;
+use Getopt::Long;
+use Pod::Usage;
+use POSIX;
+use strict;
+
+use MP3::Info;
+use Util::Logger;
+
+my $VERSION = get_version('$Name: rel_1_03 $') || 'non-released; CVS $Id: mms-m3umaker,v 1.2 2005-07-31 10:35:13 odin Exp $';
+
+##### process command line options #############################################
+
+my $options = { # set defaults
+  backup => 0,
+  filename => '00--playlist.m3u',
+  help => 0,
+  man => 0,
+  recurse => 0,
+  sweep => 0,
+  verbose => 'INFO',
+  version => '',
+  extended => 0,
+  DIRS => []
+};
+
+unless (parseCommandLineOptions($options)) {
+  usage_err("could not parse command line arguments");
+}
+
+##### instantiate used classes #################################################
+
+my $log = Util::Logger->new({ loglevel => $options->{verbose} });
+
+##### special command line options #############################################
+
+if ($options->{help} == 1) {
+  pod2usage(-exitval => 0, -verbose => 0);
+} elsif ($options->{help} > 1) {
+  pod2usage(-exitval => 0, -verbose => 1);
+} elsif ($options->{man}) {
+  pod2usage(-exitval => 0, -verbose => 2);
+} elsif ($options->{version}) {
+  print "$VERSION\n";
+  exit(0);
+} elsif (!@ARGV) {
+  usage_err("at least one directory expected");
+} else {
+  foreach my $item (@ARGV) {
+    if (-d $item) {
+      push @{$options->{DIRS}}, $item;
+    } else {
+      $log->print('WARN', "Ignoring command line argument '$item'. ".
+                          "This is no directory.");
+    }
+  }
+}
+
+##### core functionality #######################################################
+
+# process directories
+foreach my $dir (@{$options->{DIRS}}) {
+  find({ preprocess => \&preprocess, wanted => sub { } }, $dir);
+}
+
+$log->print('INFO', 'Done.');
+exit 0;
+
+################################################################################
+##### SUBROUTINES ##############################################################
+################################################################################
+
+sub preprocess {
+  $log->print('INFO', 'processing directory '.$File::Find::dir);
+  my @dirs = ();
+  my @mp3files = ();
+  my @playlists = ();
+  my $doNothing = 0; # writing no playlist if true
+
+  while (my $element = shift @_) {
+    if (-d $element  &&  $options->{recurse}  &&  $element !~ m/^\.{1,2}$/) {
+      push @dirs, $element;
+
+    } elsif (-f $element  &&  $element =~ m/\.mp3$/i) {
+      push @mp3files, $element;
+
+    } elsif (-f $element  &&  $element =~ m/\.m3u$/i) {
+      push @playlists, $element;
+    }
+  }
+  @mp3files = sort(@mp3files) if (@mp3files); # lexical order of filenames
+
+  if ($options->{backup}  &&  @playlists > 0) {
+    # make sure not to overwrite an existing playlist
+    $doNothing = 1 unless (backup(\@playlists));
+  }
+
+  if ($options->{sweep}  &&  !$options->{backup}  &&  @playlists > 0) {
+    sweep(\@playlists); # erase all playlists
+  }
+
+  writePlaylist(\@mp3files) if (@mp3files  &&  !$doNothing);
+
+  return sort(@dirs);
+}
+
+################################################################################
+
+sub backup {
+  my $playlists = shift;
+
+  if (ref($playlists) eq 'ARRAY') {
+    foreach my $playlist (@{$playlists}) {
+      if ($playlist eq $options->{filename}) {
+        # target filename already exists, so rename it
+        my ($name, $extension);
+        if ($playlist =~ m/^(.+)\.(.+)$/) {
+          $name = $1;
+          $extension = ".$2";
+        } else {
+          $name = $playlist;
+          $extension = '';
+        }
+
+        for (my $i = 0; $i < 1000; ++$i) {
+          my $newName = $name.sprintf(".%03d", $i).$extension;
+          if (!-e $newName) {
+            # found a filename that is not used yet
+            if (rename $playlist, $newName) {
+              $log->print('MORE', "renamed playlist '$playlist' to '$newName'");
+              return 1;
+
+            } else {
+              $log->print('ERROR', "making backup of playlist '$playlist': ".
+                                   "renaming to '$newName' failed");
+              return undef;
+            }
+          }
+        }
+        $log->print('ERROR', "making backup of playlist '$playlist': ".
+                   "could not find an unused filename for renaming; giving up");
+        return undef;
+      }
+    }
+    return 1; # there was nothing to do, so nothing failed :)
+  }
+  return undef;
+}
+
+################################################################################
+
+sub sweep {
+  my $playlists = shift;
+
+  if (ref($playlists) eq 'ARRAY') {
+    foreach my $playlist (@{$playlists}) {
+      $log->print('MORE', "erasing playlist '$playlist'");
+      if (-w $playlist  &&  unlink($playlist) == 1) {
+        return 1;
+      } else {
+        $log->print('WARN',
+                   "cannot erase playlist '$playlist'; check file permissions");
+      }
+    }
+  }
+  return undef;
+}
+
+################################################################################
+
+sub writePlaylist {
+  my $files = shift;
+
+  if (ref($files) eq 'ARRAY') {
+    if (!open(HNDL, ">".$options->{filename})) {
+      $log->print('ERROR', "cannot write to file '$options->{filename}'");
+      return undef;
+    }
+    $log->print('MORE', "writing playlist '$options->{filename}'");
+    print HNDL "#EXTM3U\n" if ($options->{extended});
+
+    foreach my $file (@{$files}) {
+      if ($options->{extended}) {
+        my $mp3Info = get_mp3info($file);
+        my $mp3Tag = get_mp3tag($file, 1);
+        if (defined $mp3Info  &&  defined $mp3Tag  &&
+            defined $mp3Info->{SECS}  &&
+            defined $mp3Tag->{ARTIST}  &&  defined $mp3Tag->{TITLE}) {
+          print HNDL "#EXTINF:"
+                     .POSIX::floor($mp3Info->{SECS})
+                     .","
+                     .$mp3Tag->{ARTIST}
+                     ." - "
+                     .$mp3Tag->{TITLE}
+                     ."\n";
+        } else {
+          $log->print('WARN', "file '$file': ".
+                      "cannot read enough information for writing extended ".
+                      "playlist entry; creating standard entry");
+        }
+      }
+      print HNDL $file."\n";
+    }
+
+    close HNDL;
+  }
+  return undef;
+}
+
+################################################################################
+
+sub parseCommandLineOptions {
+  my $opts = shift;
+  return undef unless (ref($opts) eq 'HASH');
+
+  my $optionParser = Getopt::Long::Parser->new(config => ["bundling"]);
+
+  return $optionParser->getoptions(
+    'backup|b' => \$opts->{backup},
+    'filename|f=s' => \$opts->{filename},
+    'help|h|?+' => \$opts->{help},
+    'man' => \$opts->{man},
+    'recurse|r' => \$opts->{recurse},
+    'sweep' => \$opts->{sweep},
+    'verbose|v=s' => \$opts->{verbose},
+    'version|V' => \$opts->{version},
+    'extended|x' => \$opts->{extended}
+  );
+}
+
+################################################################################
+# get_version('$Name: rel_1_03 $')
+#
+# Extracts the release version from the CVS Name Tag that was used to checkout
+# or export the file from the repository.
+# Returns undef if it is empty (e.g. after checkout/export without -r <CVSTAG>)
+# or if it does not match the pattern (expects something like rel_1_23).
+# Otherwise a string like 1.23 is returned.
+#
+sub get_version {
+  return undef unless (defined $_[0]);
+
+  return $_[0] =~ m/rel_(\d+)_(\d+)/ ? "$1.$2" : undef;
+}
+
+################################################################################
+# usage_err([<string> err])
+#
+# This exits the program with return code 1 after printing a hint how
+# to use it.
+# This hint is the SYNOPSIS section of the program's POD documentation.
+# The optional err argument can be given to print an error message first.
+#
+sub usage_err {
+  my $err = shift;
+
+  if (defined $err) {
+    pod2usage(-exitval => 1, -verbose => 0, -message => "\nERROR: $err\n");
+  } else {
+    pod2usage(-exitval => 1, -verbose => 0);
+  }
+}
+
+
+__END__
+
+
+=head1 NAME
+
+mms-m3umaker - generate MP3 playlists
+
+
+
+=head1 SYNOPSIS
+
+How to get help:
+If one of the B<--help> options is specified once a short overview will
+be printed;
+if specified twice you will get detailed information about command line options.
+B<--man> gives you the whole manual.
+
+B<mms-m3umaker>
+[ B<-b>, B<--backup> ]
+[ B<-f>, B<--filename> I<STRING> ]
+[ B<-r>, B<--recurse> ]
+[ B<--sweep> ]
+[ B<-v>, B<--verbose> I<STRING> ]
+[ B<-x>, B<--extended> ]
+F<DIRECTORY> F<[...]>
+
+B<mms-m3umaker> B<-?>, B<-h>, B<--help> | B<--man>
+
+B<mms-m3umaker> B<-V>, B<--version>
+
+
+
+=head1 DESCRIPTION
+
+B<mms-m3umaker> is part of the `mp3ManagementSuite' which is a collection of
+programs that help maintaining music collections.
+
+B<mms-m3umaker> will search for .mp3 files within the given directories and
+generate a playlist file listing them lexically ordered.
+Thus you can easily play them with your mp3 player software.
+This program has helpful options such as creating playlists for each folder of
+a directory tree.
+Moreover you can keep your playlists up to date by running this tool whenever
+you think it's time to refresh after some changes.
+
+
+=head1 OPTIONS
+
+This paragraph describes the possible options that can be used to modify this
+program's behaviour.
+If a long option name requires an argument then the short form does so, too.
+Long names can be abbreviated but must stay unique.
+Short options can be bundled even if they have arguments; thus `-a12b34c' is
+equivalent to `-a 12 -b 34 -c'.
+To avoid ambiguity you can use ` -- ' to seperate the options from the list of
+directories.
+
+=over 4
+
+=item B<-?>, B<-h>, B<--help>
+
+Prints the possible options and exits.
+
+
+=item B<--man>
+
+Prints the whole manual and exits.
+
+
+=item B<-b>, B<--backup>
+
+Never erase or overwrite a playlist file. If a directory already contains a
+playlist that has the same name like the one to be created a backup will be
+made. Playlists with other names are not touched at all.
+NOTE: This implicitly disables the B<--sweep> option.
+
+
+=item B<-f>, B<--filename> I<STRING>
+
+Sets a custom filename for the playlist to be generated.
+DEFAULT: C<00--playlist.m3u>
+
+
+=item B<-r>, B<--recurse>
+
+Enables recursive processing of subdirectories for each of the given directory
+arguments.
+
+
+=item B<--sweep>
+
+Enables the `sweep mode' which erases already existing playlists, i.e.
+playlists with other filenames that would not be overwritten and could
+therefore cause irritation afterwards.
+
+
+=item B<-v>, B<--verbose> I<STRING>
+
+Adjusts the level of output verbosity. There are five categories, ordered by
+severity. This setting means that all messages up to the given severity level
+will be reported; less severe messages will be suppressed.
+
+I<STRING> defaults to C<INFO> which means that all messages from the categories
+C<FATAL>, C<ERROR>, C<WARN> and C<INFO> will be reported.
+Possible values for I<STRING> are:
+
+  FATAL
+  ERROR
+  WARN
+  INFO
+  MORE
+
+
+=item B<-V>, B<--version>
+
+Prints the program version and exits.
+
+
+=item B<-x>, B<--extended>
+
+Enables generation of extended playlist files. Some players will read the
+extended info (length in seconds, artist, title) from the playlist rather than
+evaluating the file itself and hereby gain performance.
+
+
+=back
+
+
+
+=head1 COPYRIGHT AND LICENCE
+
+Copyright (C) 2004   Joachim Jautz   http://www.jay-jay.net/contact.html
+
+This program is free software; you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation; either version 2 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program; if not, write to the Free Software
+Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
+
+=cut

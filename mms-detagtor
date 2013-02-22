@@ -1,0 +1,512 @@
+#!/usr/bin/perl -w
+#
+# $Id: mms-detagtor,v 1.4 2006-09-30 16:15:36 odin Exp $
+# $Name: rel_1_03 $
+#
+###############################################################################
+#
+# Copyright (C) 2004   Joachim Jautz   http://www.jay-jay.net/contact.html
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 2 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
+#
+###############################################################################
+
+use File::Basename;
+use File::Find;
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+use MP3::Info;
+use MP3::InfoTag ':typical';
+use Util::Logger;
+
+my $VERSION = get_version('$Name: rel_1_03 $') || 'non-released; CVS $Id: mms-detagtor,v 1.4 2006-09-30 16:15:36 odin Exp $';
+
+##### process command line options #############################################
+
+my $options = { # set defaults
+  help => 0,
+  find => {},
+  long => 0,
+  man => 0,
+  recurse => 0,
+  verbose => 'INFO',
+  version => '',
+  DIRS => [],
+  FILES => []
+};
+
+unless (parseCommandLineOptions($options)) {
+  usage_err("could not parse command line arguments");
+}
+
+##### instantiate used classes #################################################
+
+my $log = Util::Logger->new({ loglevel => $options->{verbose} });
+
+##### special command line options #############################################
+
+if ($options->{help} == 1) {
+  pod2usage(-exitval => 0, -verbose => 0);
+} elsif ($options->{help} > 1) {
+  pod2usage(-exitval => 0, -verbose => 1);
+} elsif ($options->{man}) {
+  pod2usage(-exitval => 0, -verbose => 2);
+} elsif ($options->{version}) {
+  print "$VERSION\n";
+  exit(0);
+} elsif (!@ARGV) {
+  usage_err("at least one file or directory expected");
+} else {
+  foreach my $item (@ARGV) {
+    if (-d $item) {
+      push @{$options->{DIRS}}, $item;
+    } elsif (-f $item) {
+      ($item =~ m/\.mp3/i)
+        ? push @{$options->{FILES}}, $item
+        : $log->print('WARN', "Ignoring file argument '$item'. ".
+                              "Only files with .mp3 extension are processed; ".
+                              "other files have no ID3 tags by convention.");
+    } else {
+      $log->print('WARN', "Ignoring command line argument '$item'. ".
+                          "It is neither a directory nor a file.");
+    }
+  }
+}
+
+##### core functionality #######################################################
+
+# process directories
+foreach my $dir (@{$options->{DIRS}}) {
+  find({ preprocess => \&preprocess, wanted => \&process }, $dir);
+}
+
+# process files
+foreach my $file (@{$options->{FILES}}) {
+  $log->print('INFO', 'processing file '.$file);
+  processFile($file);
+}
+
+$log->print('INFO', 'Done.');
+exit 0;
+
+################################################################################
+##### SUBROUTINES ##############################################################
+################################################################################
+
+sub preprocess {
+  $log->print('INFO', 'processing directory '.$File::Find::dir);
+  my @result = ();
+  while (my $element = shift @_) {
+    if (-d $element  &&  $options->{recurse}  &&  $element !~ m/^\.{1,2}$/  ||
+        -f $element  &&  $element =~ m/\.mp3$/i) {
+      push @result, $element;
+    }
+  }
+  return sort(@result);
+}
+
+################################################################################
+
+sub process {
+  # File::Find also passes current directory name that we do not need here
+  return if (-d $_);
+  processFile($_);
+}
+
+################################################################################
+
+sub processFile {
+  my $file = shift;
+  unless (-f $file && -r $file) {
+    $log->print('WARN', "file '$file' is no file or not readable");
+    return;
+  }
+  my $basename = basename($file);
+
+  # look for available tags
+  my $tags = {};
+  $tags->{v1} = get_mp3tag($file, 1);
+  $tags->{v2} = get_mp3tag($file, 2);
+
+  # apply user-defined search filters
+  my $isMatch = matchFilter($tags);
+  unless (defined $isMatch) {
+    $log->print('FATAL',
+                'error in filter rules, check --find options. Aborting.');
+    exit 1;
+  }
+  return unless $isMatch;
+
+  # print tag versions found
+  $log->print('INFO', "ID3 tags "
+                      .(defined $tags->{v1} ? '[v1]' : '[  ]')
+                      .(defined $tags->{v2} ? '[v2]' : '[  ]')
+                      ." found in file '$basename'");
+
+  # output tag contents
+  if (defined $tags->{v1}) {
+    if ($options->{long} == 1) {
+      # one line of tag summary output
+      $log->print('INFO', printTag($tags->{v1}));
+
+    } elsif ($options->{long} >= 1) {
+      # detailed output, one line per tag field
+      foreach my $line (@{getLongTagInfo($tags->{v1})}) {
+        $log->print('INFO', $line);
+      }
+    }
+  }
+}
+
+################################################################################
+
+sub parseCommandLineOptions {
+  my $opts = shift;
+  return undef unless (ref($opts) eq 'HASH');
+
+  my $optionParser = Getopt::Long::Parser->new(config => ["bundling"]);
+
+  return $optionParser->getoptions(
+    'help|h|?+' => \$opts->{help},
+    'find=s' => $opts->{find},
+    'long|l+' => \$opts->{long},
+    'man' => \$opts->{man},
+    'recurse|r' => \$opts->{recurse},
+    'verbose|v=s' => \$opts->{verbose},
+    'version|V' => \$opts->{version}
+  );
+}
+
+################################################################################
+# get_version('$Name: rel_1_03 $')
+#
+# Extracts the release version from the CVS Name Tag that was used to checkout
+# or export the file from the repository.
+# Returns undef if it is empty (e.g. after checkout/export without -r <CVSTAG>)
+# or if it does not match the pattern (expects something like rel_1_23).
+# Otherwise a string like 1.23 is returned.
+#
+sub get_version {
+  return undef unless (defined $_[0]);
+
+  return $_[0] =~ m/rel_(\d+)_(\d+)/ ? "$1.$2" : undef;
+}
+
+################################################################################
+# usage_err([<string> err])
+#
+# This exits the program with return code 1 after printing a hint how
+# to use it.
+# This hint is the SYNOPSIS section of the program's POD documentation.
+# The optional err argument can be given to print an error message first.
+#
+sub usage_err {
+  my $err = shift;
+
+  if (defined $err) {
+    pod2usage(-exitval => 1, -verbose => 0, -message => "\nERROR: $err\n");
+  } else {
+    pod2usage(-exitval => 1, -verbose => 0);
+  }
+}
+
+################################################################################
+# matchFilter(<hashRef> tags)
+#
+# Description: Expects a hashRef as parameters with 'v1' and 'v2' as keys and
+#       the corresponding tag hashRef as values. User-defined filters, specified
+#       in $options->{find}, are evaluated. If a filter of type FIELD=VALUE is
+#       given it will be checked against the v1 tag fields. It will fail if no
+#       v1 tag is available at all.
+#
+# Returns:
+#       1       if all filters matched
+#       0       if at least one filter did not match
+#       undef   if at least one filter could not be interpreted
+#
+sub matchFilter {
+  my $tags = shift;
+  die unless (ref($tags) eq 'HASH');
+
+  my @searchKeys = keys %{$options->{find}};
+  return 1 unless (@searchKeys > 0);    # no filters defined => result is true
+  my @evalStrings = ();
+  my $tagFields = getTagFields();
+  my $needsV1 = 0;
+
+  if (@searchKeys) {
+    foreach my $searchKey (@searchKeys) {
+      my $searchValue = defined $options->{find}->{$searchKey}
+                        ? $options->{find}->{$searchKey}
+                        : '';
+      if (($searchKey.'='.$searchValue) =~ m/^v([12])=(true|false)$/i) {
+        # search for specific tag versions?
+        my ($ver, $bool) = ($1, $2);
+        push @evalStrings, ($bool =~ m/^true$/i ? '' : '!').'(defined $tags->{v'.$ver.'})';
+      }
+      elsif (exists $tagFields->{uc($searchKey)}) {
+        # search for a match in a certain field
+        $needsV1 = 1; # search for field content => ID3 Tag v1 must be available
+        push @evalStrings, '($tags->{v1}->{'.(uc $searchKey).'} =~ m/'.$searchValue.'/i)';
+      }
+      else {
+        # indicate erroneous user input
+        return undef;
+      }
+    }
+
+    unshift @evalStrings, '(defined $tags->{v1})' if ($needsV1);
+#TODO comment on next line for speed-up
+    $log->print('DEBUG', "evalStrings is: ".join(' && ', @evalStrings));
+    my $result = eval(join(' && ', @evalStrings));
+    $log->print('DEBUG', "eval result is: ".($result ? 1 : 0));
+    return $result ? 1 : 0;
+  }
+  return 1;
+}
+
+################################################################################
+# getLongTagInfo(<hashRef> tag)
+#
+# Description: creates strings for each tag field that consist of a label for
+#       the tag field and its value. These strings are meant to be printed one
+#       after another, each in a new line because the space between label and
+#       value is filled with dots so that you will see two columns of text.
+# Returns: an array reference
+#
+sub getLongTagInfo {
+  my $tag = shift;
+  die unless (ref($tag) eq 'HASH');
+  my $result = [];
+
+  foreach my $field (@{getTagFieldNames()}) {
+    my $label = $field;
+    # h-fill with dots for better reading; ID3v1 tags' names' max length is 8
+    $label .= '.' while (length($label) < 11);
+    push @{$result}, $label.': '.(defined $tag->{$field} ? $tag->{$field} : '');
+  }
+
+  return $result;
+}
+
+################################################################################
+
+
+__END__
+
+
+=head1 NAME
+
+mms-detagtor - show and search ID3 tag info of MP3 files
+
+
+
+=head1 SYNOPSIS
+
+How to get help:
+If one of the B<--help> options is specified once a short overview will
+be printed;
+if specified twice you will get detailed information about command line options.
+B<--man> gives you the whole manual.
+
+B<mms-detagtor>
+[ B<--find> I<KEY>=I<VALUE> ]
+[ B<-l>, B<--long> ]
+[ B<-r>, B<--recurse> ]
+[ B<-v>, B<--verbose> I<STRING> ]
+{ F<FILE> | F<DIRECTORY> } F<...>
+
+B<mms-detagtor> B<-?>, B<-h>, B<--help> | B<--man>
+
+B<mms-detagtor> B<-V>, B<--version>
+
+
+
+=head1 DESCRIPTION
+
+B<mms-detagtor> is part of the `mp3ManagementSuite' which is a collection of
+programs that help maintaining music collections.
+
+You can decide which .mp3 files will be processed by passing names of files or
+directories. At least one file or directory is expected.
+
+By default the versions of ID3 tags found within each file will be reported.
+With the B<--long> option specified once or twice the contents of the tag
+fields will be shown.
+But the real strength of this program is its B<--filter> option which enables
+you to find files that match some criteria, e.g. you could search for all files
+which have an entry in their `artist' field that matches your search pattern or
+you could search for files that have an ID3 tag version2 but no ID3 tag
+version1 and so on.
+
+Please read the section ID3 TAG VERSIONS for general information about tags as
+well as some explanations how different tag versions are handled by this
+program.
+
+
+
+=head1 OPTIONS
+
+This paragraph describes the possible options that can be used to modify this
+program's behaviour.
+If a long option name requires an argument then the short form does so, too.
+Long names can be abbreviated but must stay unique.
+Short options can be bundled even if they have arguments; thus `-a12b34c' is
+equivalent to `-a 12 -b 34 -c'.
+To avoid ambiguity you can use ` -- ' to seperate the options from the list of
+directories and files.
+
+=over 4
+
+=item B<-?>, B<-h>, B<--help>
+
+Prints the SYNOPSIS section of this manual and exits.
+If this option is passed twice the OPTIONS section will be printed, too.
+
+
+=item B<--man>
+
+Prints the whole manual and exits.
+
+
+=item B<-l>, B<--long>
+
+If specified once: prints a one-line tag summary output.
+If specified twice: prints detailed tag information, one line per tag field.
+
+
+=item B<--find> I<KEY>=I<VALUE>
+
+Filters those files that match the specified criteria.
+If this option is used multiple times a file must match all of the given
+criteria.
+
+Both I<KEY> and I<VALUE> are case-insensitive. Valid I<KEY>s will be explained
+below.
+It is recommended to enclose I<VALUE> in quotes that protect your filter from
+shell expansion (see examples at the end of this section).
+
+There are two types of filters, one for detecting tag versions and one for
+filtering by tag field contents:
+
+You can find MP3 files with or without ID3 tag version 1 or 2 by using C<v1> or
+C<v2> as I<KEY> and either C<true> or C<false> as I<VALUE>.
+For example, C<--find v1=true --find v2=false> will reveal all files that have
+a v1 tag and no v2 tag.
+
+You can filter files based on the contents of their tag fields.
+Note that this type of B<--find> works on v1 tags only and therefore
+implicates C<--find v1=true>.
+
+Possible field names to be used as I<KEY> are:
+
+  TITLE
+  ARTIST
+  ALBUM
+  YEAR
+  COMMENT
+  TRACKNUM
+  GENRE
+
+The string you specify as I<VALUE> will be interpreted as a regular expression.
+To avoid this start it with C<\Q> and all meta characters will loose their
+special meaning.
+
+Examples:
+Find songs by John Doe or John Foo, the `h' in their first name being optional:
+C<--find ARTIST='Joh?n (Doe|Foo)'>.
+Find the song named So What? and do not treat the string as a regular
+expression, saving the question mark from being a meta character: C<--find
+title='\QSo What?'>.
+
+
+=item B<-r>, B<--recurse>
+
+Enables recursive processing of subdirectories for each of the given directory
+arguments.
+
+
+=item B<-v>, B<--verbose> I<STRING>
+
+Adjusts the level of output verbosity. There are five categories, ordered by
+severity. This setting means that all messages up to the given severity level
+will be reported; less severe messages will be suppressed.
+
+I<STRING> defaults to C<INFO> which means that all messages from the categories
+C<FATAL>, C<ERROR>, C<WARN> and C<INFO> will be reported.
+Possible values for I<STRING> are:
+
+  FATAL
+  ERROR
+  WARN
+  INFO
+  MORE
+
+
+=item B<-V>, B<--version>
+
+Prints the program version and exits.
+
+
+=back
+
+
+
+=head1 ID3 TAG VERSIONS
+
+The so-called tag is a small optional part of an MPEG Layer 3 file that contains
+information about the audio part, e.g. the artist's name, a comment etc.
+
+There are two major versions of MP3 tag formats, C<ID3v1> and C<ID3v2>.
+All programs of the `mp3ManagementSuite' are focused on the C<ID3v1> tag
+(or C<ID3v1.1> if the C<TRACKNUM> field is used).
+In most cases the presence of an C<ID3v2> tag will be simply ignored.
+
+More specifically, it will never be read from or written to a version2 tag.
+There are only two actions that involve version2 tags:
+You can use B<mms-detagtor> to find files depending on their tag version
+and you can use B<mms-settag> to erase version2 tags.
+
+This behaviour is due to the author's opinion that C<ID3v2> is totally
+superfluous. Most people are not even able to maintain the v1-tags of their
+music archive (except if they use tools like this ;)).
+Moreover, in comparison to v1-tags that are appended to the file, v2-tags are
+prepended and this means that the whole file must be rewritten every time a
+v2-tag is changed. Contrary opinions are respected but there are other tools for
+those people's requirements.
+
+
+
+=head1 COPYRIGHT AND LICENCE
+
+Copyright (C) 2004   Joachim Jautz   http://www.jay-jay.net/contact.html
+
+This program is free software; you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation; either version 2 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program; if not, write to the Free Software
+Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
+
+=cut

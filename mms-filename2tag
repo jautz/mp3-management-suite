@@ -1,0 +1,599 @@
+#!/usr/bin/perl -w
+#
+# $Id: mms-filename2tag,v 1.6 2012-04-09 13:17:52 odin Exp $
+# $Name: rel_1_03 $
+#
+###############################################################################
+#
+# Copyright (C) 2004   Joachim Jautz   http://www.jay-jay.net/contact.html
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 2 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
+#
+###############################################################################
+
+use File::Basename;
+use File::Find;
+use Getopt::Long;
+use Pod::Usage;
+use strict;
+
+use MP3::Info;
+use MP3::InfoTag ':typical';
+use Util::Logger;
+
+my $VERSION = get_version('$Name: rel_1_03 $') || 'non-released; CVS $Id: mms-filename2tag,v 1.6 2012-04-09 13:17:52 odin Exp $';
+
+# used for tracklist processing
+my $TITLE_PLACEHOLDER = '((TITLE))';
+
+##### process command line options #############################################
+
+my $options = { # set defaults
+  case => undef,
+  help => 0,
+  man => 0,
+  pattern => '((IGNORE))',
+  purify => 0,
+  recurse => 0,
+  simulate => 0,
+  tracklist => undef,
+  verbose => 'INFO',
+  version => '',
+  weed => undef,
+  DIRS => [],
+  FILES => [],
+  TITLES => []
+};
+
+unless (parseCommandLineOptions($options)) {
+  usage_err("could not parse command line arguments");
+}
+
+##### instantiate used classes #################################################
+
+my $log = Util::Logger->new({ loglevel => $options->{verbose} });
+
+##### special command line options #############################################
+
+if ($options->{help} == 1) {
+  pod2usage(-exitval => 0, -verbose => 0);
+} elsif ($options->{help} > 1) {
+  pod2usage(-exitval => 0, -verbose => 1);
+} elsif ($options->{man}) {
+  pod2usage(-exitval => 0, -verbose => 2);
+} elsif ($options->{version}) {
+  print "$VERSION\n";
+  exit(0);
+} elsif (!@ARGV) {
+  usage_err("at least one file or directory expected");
+} else {
+  foreach my $item (@ARGV) {
+    if (-d $item) {
+      push @{$options->{DIRS}}, $item;
+    } elsif (-f $item) {
+      ($item =~ m/\.mp3/i)
+        ? push @{$options->{FILES}}, $item
+        : $log->print('WARN', "Ignoring file argument '$item'. ".
+                              "In order to avoid corruption of files ".
+                              "only those with .mp3 extension are processed.");
+    } else {
+      $log->print('WARN', "Ignoring command line argument '$item'. ".
+                          "It is neither a directory nor a file.");
+    }
+  }
+}
+
+##### core functionality #######################################################
+
+# process directories
+foreach my $dir (@{$options->{DIRS}}) {
+  find({ preprocess => \&preprocess, wanted => \&process }, $dir);
+}
+
+# process files
+if (@{$options->{FILES}}) {
+  read_tracklist({ cwd => 0 }) if ($options->{tracklist});
+  foreach my $file (@{$options->{FILES}}) {
+    $log->print('INFO', 'processing file '.$file);
+    processFile($file);
+  }
+}
+
+$log->print('INFO', 'Done.');
+exit 0;
+
+################################################################################
+##### SUBROUTINES ##############################################################
+################################################################################
+# read_tracklist({ cwd => BOOL })
+sub read_tracklist {
+  my $args = shift;
+  die unless (ref($args) eq 'HASH');
+  die unless (defined $args->{cwd});
+
+  # make sure that TITLES points to an empty list and fill it at function's end
+  my @list = ();
+  $options->{TITLES} = \@list;
+
+  my $tracklist_file = $options->{tracklist};
+  return undef unless ($tracklist_file);
+
+  if ($args->{cwd}) {
+    # file has to be in current working dirrectory; find out basename
+    $tracklist_file = basename($tracklist_file);
+  }
+
+  unless (open FILE_IN, $tracklist_file) {
+    $log->print('ERROR', "cannot open tracklist '$tracklist_file'");
+    return undef;
+  }
+
+  while (<FILE_IN>) {
+    next if (m/^\s*(#|$)/); # skip empty or comment lines
+    push @list, $_;
+  }
+  close FILE_IN;
+}
+
+################################################################################
+
+sub preprocess {
+  $log->print('INFO', 'processing directory '.$File::Find::dir);
+  my @result = ();
+  # filter for non-symbolic directory names and .mp3 files
+  while (my $element = shift @_) {
+    if (-d $element  &&  $options->{recurse}  &&  $element !~ m/^\.{1,2}$/  ||
+        -f $element  &&  $element =~ m/\.mp3$/i) {
+      push @result, $element;
+    }
+  }
+
+  # look for a tracklist in current working dirrectory
+  read_tracklist({ cwd => 1 }) if ($options->{tracklist});
+
+  # process results lexically sorted
+  return sort(@result);
+}
+
+################################################################################
+
+sub process {
+  # File::Find also passes current directory name that we do not need here
+  return if (-d $_);
+  processFile($_);
+}
+
+################################################################################
+
+sub processFile {
+  my $file = shift;
+  unless (-f $file && -r $file) {
+    $log->print('WARN', "file '$file' is no file or not readable");
+    return;
+  }
+  my ($name, $path, $extension);
+  ($name, $path, $extension) = fileparse($file, '\.\w+');
+  my $basename = $name.$extension;
+
+  my $tag;
+  if ($options->{purify}) { # create a new tag
+    $tag = createNewTag();
+  } else { # get existing tag for update (if available) or create a new one
+    $tag = get_mp3tag($file, 1) || createNewTag();
+  }
+  $log->print('DEBUG', "file '$basename': current ID3 tag: ".printTag($tag));
+
+  # prepare arguments for string2tag function call
+  my $string2tag_args = { str => $name,
+                          pattern => $options->{pattern},
+                          tag => $tag,
+                          case => $options->{case} };
+  # set string2tag weed parameter if requested by command line
+  if (defined $options->{weed}) {
+    $string2tag_args->{weed} = ($options->{weed} eq '' ? '_' : $options->{weed});
+  }
+  # set tag field TITLE according to tracklist?
+  if ($options->{tracklist}) {
+    if (! $tag->{TRACKNUM}) {
+      $log->print('WARN', "file '$file': cannot set title by tracklist "
+                         ."because TRACKNUM field is not set");
+    } elsif ($tag->{TRACKNUM} > @{$options->{TITLES}}) {
+      $log->print('WARN', "file '$file': no tracklist entry for title #"
+                         .$tag->{TRACKNUM});
+    } else {
+      # append title from playlist to $name and adjust pattern
+      my $new_title = $options->{TITLES}->[$tag->{TRACKNUM} - 1];
+      my $separator = get_uniq_str($string2tag_args->{str});
+      $string2tag_args->{str} .= $separator.$new_title;
+      $string2tag_args->{pattern} .= $separator.$TITLE_PLACEHOLDER;
+    }
+  }
+  # finally, call string2tag
+  my $changedFields = string2tag($string2tag_args);
+
+  if (my @warnings = MP3::InfoTag::flushWarnings()) {
+    $log->print('WARN', "file '$file': ".join('; ', @warnings));
+  }
+
+  if (!defined $changedFields) {
+    $log->print('ERROR',
+                "file '$file': string2tag failed: ".MP3::InfoTag::getError());
+  } else { # string2tag succeeded, now check if tag rewriting is neccessary
+    if ($changedFields == 0  &&  !$options->{purify}) {
+      $log->print('MORE',
+             "file '$basename': ID3 tag already set correctly. Doing nothing.");
+
+    } else {
+      if ($options->{simulate}) {
+        $log->print('INFO', "file '$basename': new ID3 tag would be: ".
+                            printTag($tag));
+      } elsif (-w $file) {
+        if (set_mp3tag($file, $tag)) {
+          $log->print('MORE', "file '$basename': new ID3 tag is: ".
+                              printTag($tag));
+        } else {
+          $log->print('ERROR', "file '$file': cannot write ID3 tag.");
+        }
+
+      } else {
+        $log->print('WARN', "file '$file' is read-only. Cannot write ID3 tag.");
+      }
+    }
+  }
+
+}
+
+################################################################################
+# Returns a string that is guaranteed not to be part of the input string
+
+sub get_uniq_str {
+  my $uniq = '_UNIQUE_STR_';
+  my $input = shift or return $uniq;
+
+  # be case insensitive, just to be on the safe side
+  while ($input =~ m/\Q$uniq/i) {
+    $uniq .= "_$$";
+  }
+  return $uniq;
+}
+
+################################################################################
+
+sub parseCommandLineOptions {
+  my $opts = shift;
+  return undef unless (ref($opts) eq 'HASH');
+
+  my $optionParser = Getopt::Long::Parser->new(config => ["bundling"]);
+
+  return $optionParser->getoptions(
+    'case|c=i' => \$opts->{case},
+    'help|h|?+' => \$opts->{help},
+    'man' => \$opts->{man},
+    'pattern=s' => \$opts->{pattern},
+    'purify' => \$opts->{purify},
+    'recurse|r' => \$opts->{recurse},
+    'simulate|s' => \$opts->{simulate},
+    'tracklist|t=s' => \$opts->{tracklist},
+    'verbose|v=s' => \$opts->{verbose},
+    'version|V' => \$opts->{version},
+    'weed|w:s' => \$opts->{weed}
+  );
+}
+
+################################################################################
+# get_version('$Name: rel_1_03 $')
+#
+# Extracts the release version from the CVS Name Tag that was used to checkout
+# or export the file from the repository.
+# Returns undef if it is empty (e.g. after checkout/export without -r <CVSTAG>)
+# or if it does not match the pattern (expects something like rel_1_23).
+# Otherwise a string like 1.23 is returned.
+#
+sub get_version {
+  return undef unless (defined $_[0]);
+
+  return $_[0] =~ m/rel_(\d+)_(\d+)/ ? "$1.$2" : undef;
+}
+
+################################################################################
+# usage_err([<string> err])
+#
+# This exits the program with return code 1 after printing a hint how
+# to use it.
+# This hint is the SYNOPSIS section of the program's POD documentation.
+# The optional err argument can be given to print an error message first.
+#
+sub usage_err {
+  my $err = shift;
+
+  if (defined $err) {
+    pod2usage(-exitval => 1, -verbose => 0, -message => "\nERROR: $err\n");
+  } else {
+    pod2usage(-exitval => 1, -verbose => 0);
+  }
+}
+
+
+__END__
+
+
+
+=head1 NAME
+
+mms-filename2tag - generate ID3 tags from MP3 filenames
+
+
+
+=head1 SYNOPSIS
+
+How to get help:
+If one of the B<--help> options is specified once a short overview will
+be printed;
+if specified twice you will get detailed information about command line options.
+B<--man> gives you the whole manual.
+
+B<mms-filename2tag>
+[ B<-c>, B<--case> I<NUMBER> ]
+[ B<--pattern> I<STRING> ]
+[ B<--purify> ]
+[ B<-r>, B<--recurse> ]
+[ B<-s>, B<--simulate> ]
+[ B<-t>, B<--tracklist> F<FILE> ]
+[ B<-v>, B<--verbose> I<STRING> ]
+[ B<-w>, B<--weed> [I<STRING>] ]
+{ F<FILE> | F<DIRECTORY> } F<...>
+
+B<mms-filename2tag> B<-?>, B<-h>, B<--help> | B<--man>
+
+B<mms-filename2tag> B<-V>, B<--version>
+
+
+
+=head1 DESCRIPTION
+
+B<mms-filename2tag> is part of the `mp3ManagementSuite' which is a collection of
+programs that help maintaining music collections.
+
+You can decide which .mp3 files will be processed by passing names of files or
+directories. At least one file or directory is expected.
+
+For each file it will extract information for its ID3 tag based upon the
+filename. Normally you will therefore specify a file name pattern that a file
+must match in order to be processed.
+The ID3 tag will be modified only if all the necessary information can be
+gathered, otherwise this program will report an error message and leave the
+file unchanged.
+
+Please read the section ID3 TAG VERSIONS for general information about tags as
+well as some explanations how different tag versions are handled by this
+program.
+
+
+
+=head1 OPTIONS
+
+This paragraph describes the possible options that can be used to modify this
+program's behaviour.
+If a long option name requires an argument then the short form does so, too.
+Long names can be abbreviated but must stay unique.
+Short options can be bundled even if they have arguments; thus `-a12b34c' is
+equivalent to `-a 12 -b 34 -c'.
+To avoid ambiguity you can use ` -- ' to seperate the options from the list of
+directories and files.
+
+=over 4
+
+=item B<-?>, B<-h>, B<--help>
+
+Prints the possible options and exits.
+
+
+=item B<--man>
+
+Prints the whole manual and exits.
+
+
+=item B<-c>, B<--case> I<NUMBER>
+
+Sets the conversion mode affecting the case of tag field values that will
+be set using B<--pattern> and/or B<--tracklist> (default: no change).
+I<NUMBER> can be:
+
+  0     all characters in lower case
+  1     Capitalize the first character, the rest will be lower case
+  2     Capitalize The First Character Of Each Word, Even_This-Way
+
+
+=item B<--pattern> I<STRING>
+
+Sets a custom pattern for the expected filename format without file extension;
+C<.mp3> will be appended by this program.
+Only those files that match the given pattern will be processed; you will be
+warned about C<.mp3> files that did not match the pattern.
+
+You can define the filename format by using placeholders like C<((TITLE))>.
+If you are using an up-to-date version of MP3::InfoTag (v0.40+) the placeholder
+names can also be specified in lower case for your convenience.
+Using quotes around your pattern is stongly recommended in order to prevent
+shell interpretation of special characters.
+Possible placeholder names are:
+
+  TITLE
+  ARTIST
+  ALBUM
+  YEAR
+  COMMENT
+  TRACKNUM
+  GENRE
+
+Moreover, you may use C<IGNORE> for parts of the filename that should not
+be written into a tag field, e.g. C<((ARTIST)) - ((IGNORE)) - ((TITLE))>.
+
+The default pattern is C<((IGNORE))> so that obmitting this parameter does no
+harm.
+However, a pattern should always be set unless you do not want to set the tag
+according to information contained in the filename.
+This may be desirable if you only want to set titles using the B<--tracklist>
+feature.
+
+
+=item B<--purify>
+
+Enables a program mode that erases all ID3 tag entries before writing the
+values that were extracted from the filename.
+Of course, this affects only those files that match the B<--pattern>.
+Without using this option, affected tag entries are overwritten with their new
+value and the other entries remain unchanged.
+
+
+=item B<-r>, B<--recurse>
+
+Enables recursive processing of subdirectories for each of the given directory
+arguments.
+
+
+=item B<-s>, B<--simulate>
+
+Read-only mode, no changes will be made. Helps finding files that do not match
+the B<--pattern> and similar problems.
+This mode is a bit more verbose than the `real' mode because in a simulation
+you will probably want to see what B<would> happen. More precicely, operations
+that would change a file will be reported as C<INFO> while simulating, but in
+`real' mode you will have to switch to C<MORE> to get such an operation
+reported.
+
+
+=item B<-t>, B<--tracklist> F<FILE>
+
+Defines a tracklist file that contains track titles. This will usually be the
+tracklist of an album. Each line contains the title of one track; its
+position (the line number) corresponds to the track number this title belongs
+to. Empty lines and lines starting with a hash (#) will be skipped.
+Of course, in order to find the corresponding file it is necessary that the
+file's TRACKNUM tag field is set.
+
+It is possible to combine this feature with the B<--pattern> option, but be
+aware that any ((TITLE)) placeholders of your pattern will be overridden
+with the title from the given tracklist.
+
+When defining the tracklist file's location it is important to notice the
+difference between processing directories and processing single files that are
+explicitly specified on the command line.
+In the following, these two scenarios will be explained.
+
+=over 4
+
+=item Directories
+
+Processing of directories is done recursively. It can be assumed that the
+tracklist is meant to be different for each of these directories. Therefore a
+tracklist file named F<FILE> is searched for within the currently processed
+directory.
+If F<FILE> contains any path information it will simply be stripped off.
+Only the filename itself is considered.
+
+=item Files
+
+All files that are explicitly specified on the command line will have their
+titles set according to the given tracklist file.
+In this case, if F<FILE> contains any path information, no matter if absolute
+or relative, it will be used to localize the tracklist file.
+
+=back
+
+You may combine these scenarios by specifying both directories and filenames to
+be processed, but you should be aware of the differences. You will probably
+agree that this will almost never make sense. Instead, the B<--tracklist>
+feature is typically used with either directories only or files only.
+
+
+=item B<-v>, B<--verbose> I<STRING>
+
+Adjusts the level of output verbosity. There are five categories, ordered by
+severity. This setting means that all messages up to the given severity level
+will be reported; less severe messages will be suppressed.
+
+I<STRING> defaults to C<INFO> which means that all messages from the categories
+C<FATAL>, C<ERROR>, C<WARN> and C<INFO> will be reported.
+Possible values for I<STRING> are:
+
+  FATAL
+  ERROR
+  WARN
+  INFO
+  MORE
+
+
+=item B<-V>, B<--version>
+
+Prints the program version and exits.
+
+
+=item B<-w>, B<--weed> [I<STRING>]
+
+Replaces certain characters with spaces when writing filename fragments to tag
+fields. The I<STRING> argument is a regular expression; matching characters
+will be weeded. If I<STRING> is omitted an underscore (_) will be used as
+default.
+
+
+=back
+
+
+
+=head1 ID3 TAG VERSIONS
+
+The so-called tag is a small optional part of an MPEG Layer 3 file that contains
+information about the audio part, e.g. the artist's name, a comment etc.
+
+There are two major versions of MP3 tag formats, C<ID3v1> and C<ID3v2>.
+All programs of the `mp3ManagementSuite' are focused on the C<ID3v1> tag
+(or C<ID3v1.1> if the C<TRACKNUM> field is used).
+In most cases the presence of an C<ID3v2> tag will be simply ignored.
+
+More specifically, it will never be read from or written to a version2 tag.
+There are only two actions that involve version2 tags:
+You can use B<mms-detagtor> to find files depending on their tag version
+and you can use B<mms-settag> to erase version2 tags.
+
+This behaviour is due to the author's opinion that C<ID3v2> is totally
+superfluous. Most people are not even able to maintain the v1-tags of their
+music archive (except if they use tools like this ;)).
+Moreover, in comparison to v1-tags that are appended to the file, v2-tags are
+prepended and this means that the whole file must be rewritten every time a
+v2-tag is changed. Contrary opinions are respected but there are other tools for
+those people's requirements.
+
+
+
+=head1 COPYRIGHT AND LICENCE
+
+Copyright (C) 2004   Joachim Jautz   http://www.jay-jay.net/contact.html
+
+This program is free software; you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation; either version 2 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program; if not, write to the Free Software
+Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
+
+=cut
