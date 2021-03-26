@@ -1,3 +1,9 @@
+2021-03-26  Joachim Jautz
+
+	* mms-tag2filename: (breaking change) modify behaviour of both the
+	basic weeding rules that are always applied and the additional weeding
+	when explicitly requested. See the updated manual for details.
+
 2012-04-09  Joachim Jautz
 
 	* mms-filename2tag, mms-tag2filename: added a hint to the manual page

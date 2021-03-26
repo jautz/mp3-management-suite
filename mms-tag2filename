@@ -278,20 +278,19 @@ sub weedSpecialChars {
   my $mode = shift;
   return $fn unless (defined $fn && $mode =~ m/\d+/);
 
-  # basic weeding, done in any mode
-  $fn =~ s/[\\\/:*?"<>|]/_/g;   # replacing non-filename chars \/:*?"<>|
+  # basic weeding, always performed
+  $fn =~ tr/\x{20}-\x{7E}/_/cs; # keep only 7bit ascii printables
+  $fn =~ s/[\\\/:<>|]/_/g;      # replace chars forbiden in filenames
 
+  # full weeding if requested
   if ($mode >= 1) {
-    $fn =~ s/\s{1,}/_/g;        # (multiple) spaces to an underscore
-
-    if ($mode >= 2) {
-      $fn =~ s/[()\[\]!\$%&=]/_/g;   # replacing ()[]!$%&=
-
-      if ($mode >= 3) {
-        $fn =~ s/[.,;+~#^]/_/g;   # replacing .,;+~#^
-      }
-    }
+    $fn =~ tr/0-9A-Za-z_-/_/cs; # limit to alphanumerics, dashes, underscores
+    $fn =~ s/["'`]//g;          # drop quote-like chars
   }
+
+  $fn =~ s/_{2,}/_/g;           # condense multiple subsequent underscores
+  $fn =~ s/^_|_$//g;            # drop leading/trailing underscores
+
   return $fn;
 }
 
@@ -444,22 +443,23 @@ Prints the program version and exits.
 =item B<-w>, B<--weed>
 
 Enables the removal of some special characters that may be used within tag
-fields but cannot or should not occur in filenames.
-The B<--weed> switch can be given multiple times; the more switches the more
-will be weeded. The replacement character is the underscore.
+fields but should not occur in filenames.
 
-Some basic weeding is always done for the following forbidden
-characters: \ E<sol> : * ? " E<lt> E<gt> E<verbar>
+The replacement character is the underscore. Subsequent replacements result in
+a single underscore. Moreover, when it affects the start or end of the file
+name the weeded characters will not be replaced but trimmed.
 
-One or more B<--weed> switches will replace spaces with underscores. If there
-are two or more spaces in a row these will be converted to a single space
-first.
+When the B<--weed> switch is specified anything but letters, digits, dashes and
+underscores will be replaced. Moreover, quotes, apostrophs, and backticks will
+be omitted, i.e. not replaced but dropped.
 
-Two or more B<--weed> switches result in the additional replacement of the
-following characters: ( ) [ ] ! $ % & =
+Note that some basic weeding is always done: anything that is not a 7bit ASCII
+printable character will be replaced as well as the following characters that
+are reserved on some OS: \ E<sol> : E<lt> E<gt> E<verbar>
 
-Three or more B<--weed> switches will also replace these
-characters: . , ; + ~ # ^
+History: in former releases the B<--weed> switch could be given multiple times
+causing additive weeding. This feature has been dropped and the weeding rules
+modified as described above.
 
 
 
