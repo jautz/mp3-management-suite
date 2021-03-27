@@ -279,13 +279,13 @@ sub weedSpecialChars {
   return $fn unless (defined $fn && $mode =~ m/\d+/);
 
   # basic weeding, always performed
-  $fn =~ tr/\x{20}-\x{7E}/_/cs; # keep only 7bit ascii printables
+  $fn =~ tr/\x{20}-\x{7E}/_/cs; # replace anything but 7bit ascii printables
   $fn =~ s/[\\\/:<>|]/_/g;      # replace chars forbiden in filenames
 
   # full weeding if requested
   if ($mode >= 1) {
-    $fn =~ tr/0-9A-Za-z_-/_/cs; # limit to alphanumerics, dashes, underscores
     $fn =~ s/["'`]//g;          # drop quote-like chars
+    $fn =~ tr/0-9A-Za-z_-/_/cs; # limit to alphanumerics, dashes, underscores
   }
 
   $fn =~ s/_{2,}/_/g;           # condense multiple subsequent underscores
